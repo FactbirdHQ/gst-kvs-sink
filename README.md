@@ -51,7 +51,7 @@ gst-launch-1.0 -v \
 
 ```toml
 [dependencies]
-gst-kvs-sink = { git = "https://github.com/factbird/gst-kvs-sink", rev = "<sha>" }
+gst-kvs-sink = { git = "https://github.com/FactbirdHQ/gst-kvs-sink", rev = "<sha>" }
 ```
 
 ```rust

@@ -5,14 +5,16 @@ use gstreamer::prelude::{ElementExt, StaticType, ToValue};
 use gstreamer::subclass::prelude::*;
 use gstreamer_base::subclass::prelude::*;
 use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
-use tokio::sync::Mutex as AsyncMutex;
-use tracing::{debug, info};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tracing::debug;
 
 use super::properties::{Properties, Settings};
 use crate::buffered_upload_manager::{BufferManagerEvent, BufferStats, BufferedUploadManager};
+use crate::fragment::Fragment;
 use crate::kvs_client::KvsClient;
 use crate::media_uploader::MediaUploader;
 use crate::mkv_writer::MkvWriter;
@@ -20,6 +22,30 @@ use crate::mkv_writer::MkvWriter;
 /// Network recovery retry intervals
 const INITIAL_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Depth of the render -> upload worker handoff queue, in fragments.
+///
+/// `render()` runs on the GStreamer streaming thread and must never block on
+/// network or disk I/O: upstream is a non-leaky queue holding only ~2s of video,
+/// so any stall here starves the hardware encoder's surface pool and kills the
+/// pipeline. Fragments are handed to a worker task instead, and this bound is
+/// what keeps a stalled uploader from growing memory without limit. At 2s
+/// Immediate-mode fragments this is ~2 minutes of video.
+const FRAGMENT_QUEUE_CAPACITY: usize = 64;
+
+/// Time allowed for the upload worker to drain in-flight fragments on shutdown.
+const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A finalized fragment handed from `render()` to the upload worker.
+struct UploadItem {
+    fragment: Fragment,
+    /// Mode captured at finalize time, so the worker cannot race a mode switch.
+    mode: UploadMode,
+    /// Reset the KVS session before sending this fragment. Set on the first
+    /// fragment after an MKV writer reset so the MKV session boundary and the
+    /// KVS session boundary stay aligned to the same keyframe.
+    starts_new_session: bool,
+}
 
 /// Upload mode controlling fragment handling behavior
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +88,22 @@ struct State {
     pending_session_reset: bool,
     /// Pending mode switch to execute at next keyframe boundary (prevents frame loss)
     pending_mode_switch: Option<UploadMode>,
+    /// Handoff to the upload worker. `None` before start()/after stop().
+    fragment_tx: Option<mpsc::Sender<UploadItem>>,
+    /// Upload worker task handle
+    upload_task: Option<tokio::task::JoinHandle<()>>,
+    /// Tag the next enqueued fragment as starting a new KVS session. Set when the
+    /// MKV writer is reset at a keyframe; consumed by the next finalized fragment.
+    pending_new_session: bool,
+    /// A session reset is queued or running on the worker and has not completed.
+    ///
+    /// The uploader keeps reporting the session as expired until the worker actually
+    /// reconnects, so without this guard every fragment boundary in that window would
+    /// queue another reset. Cleared by the worker once the reset resolves - including
+    /// on failure, so a failed reset is retried at the next boundary.
+    session_reset_in_flight: Arc<AtomicBool>,
+    /// Fragments dropped because the worker queue was full (uploader and disk both stalled)
+    dropped_fragments: u64,
 }
 
 impl Default for State {
@@ -79,6 +121,11 @@ impl Default for State {
             last_recovery_attempt: None,
             pending_session_reset: false,
             pending_mode_switch: None,
+            fragment_tx: None,
+            upload_task: None,
+            pending_new_session: false,
+            session_reset_in_flight: Arc::new(AtomicBool::new(false)),
+            dropped_fragments: 0,
         }
     }
 }
@@ -495,12 +542,28 @@ impl BaseSinkImpl for KvsSink {
 
         // Set event channel for upload completion notifications
         buffer_manager.set_event_channel(event_tx);
+        let buffer_manager = Arc::new(AsyncMutex::new(buffer_manager));
+
+        // Hand-off queue to the upload worker. Every network and disk operation for
+        // finalized fragments happens on that task, never on the streaming thread.
+        let (fragment_tx, fragment_rx) = mpsc::channel(FRAGMENT_QUEUE_CAPACITY);
+        let session_reset_in_flight = Arc::new(AtomicBool::new(false));
+        let upload_task = self.ensure_runtime().spawn(Self::upload_worker(
+            self.obj().downgrade(),
+            fragment_rx,
+            Arc::clone(&self.media_uploader.read().unwrap()),
+            Arc::clone(&buffer_manager),
+            Arc::clone(&session_reset_in_flight),
+        ));
 
         state.mkv_writer = Some(mkv_writer);
-        state.buffer_manager = Some(Arc::new(AsyncMutex::new(buffer_manager)));
+        state.buffer_manager = Some(buffer_manager);
         state.waiting_for_keyframe = true;
         state.current_mode = initial_mode;
         state.buffer_event_rx = Some(event_rx);
+        state.fragment_tx = Some(fragment_tx);
+        state.upload_task = Some(upload_task);
+        state.session_reset_in_flight = session_reset_in_flight;
 
         // Release locks before calling update_fragment_duration
         drop(state);
@@ -533,10 +596,46 @@ impl BaseSinkImpl for KvsSink {
             gstreamer::info!(CAT, imp = self, "Cancelled recovery task on stop");
         }
 
+        // Note: Pending fragments are flushed in the EOS event handler before stop is called.
+        // Close the hand-off queue so the worker finishes what it already holds, then wait
+        // for it - bounded, because teardown must not hang on a stuck upload.
+        let (sender, upload_task, dropped) = {
+            let mut state = self.state.lock().unwrap();
+            (
+                state.fragment_tx.take(),
+                state.upload_task.take(),
+                state.dropped_fragments,
+            )
+        };
+        drop(sender);
+
+        if let Some(task) = upload_task {
+            let drained = tokio::task::block_in_place(|| {
+                self.ensure_runtime()
+                    .block_on(async { tokio::time::timeout(WORKER_DRAIN_TIMEOUT, task).await })
+                    .is_ok()
+            });
+
+            if !drained {
+                gstreamer::warning!(
+                    CAT,
+                    imp = self,
+                    "Upload worker did not drain within {:?} - abandoning in-flight fragments",
+                    WORKER_DRAIN_TIMEOUT
+                );
+            }
+        }
+
+        if dropped > 0 {
+            gstreamer::warning!(
+                CAT,
+                imp = self,
+                "{} fragment(s) were dropped due to a full upload queue during this run",
+                dropped
+            );
+        }
+
         let mut state = self.state.lock().unwrap();
-
-        // Note: Pending fragments are flushed in the EOS event handler before stop is called
-
         *state = State::default();
 
         gstreamer::info!(CAT, imp = self, "Stopped KVS sink");
@@ -547,9 +646,12 @@ impl BaseSinkImpl for KvsSink {
         &self,
         buffer: &gstreamer::Buffer,
     ) -> Result<gstreamer::FlowSuccess, gstreamer::FlowError> {
-        // Block on async operations using the cached runtime
-        self.ensure_runtime()
-            .block_on(async { self.render_async(buffer).await })
+        // Deliberately synchronous: this runs on the GStreamer streaming thread,
+        // and upstream is a non-leaky queue holding ~2s of video. Blocking here
+        // back-pressures the hardware encoder until its surface pool is exhausted,
+        // which fails the whole pipeline. All network and disk I/O is deferred to
+        // the upload worker task.
+        self.render_buffer(buffer)
     }
 
     fn set_caps(&self, caps: &gstreamer::Caps) -> Result<(), gstreamer::LoggableError> {
@@ -595,15 +697,8 @@ impl BaseSinkImpl for KvsSink {
             EventView::Eos(_) => {
                 gstreamer::info!(CAT, imp = self, "Received EOS, flushing pending fragment");
 
-                // Flush any pending fragment before EOS completes
-                let settings = self.settings.lock().unwrap().clone();
-                drop(settings); // Release lock before async operations
-
-                let result = self
-                    .ensure_runtime()
-                    .block_on(async { self.finalize_and_send_current_fragment().await });
-
-                if let Err(e) = result {
+                // Queue the final fragment; stop() drains the worker before teardown.
+                if let Err(e) = self.finalize_and_enqueue_current_fragment() {
                     gstreamer::warning!(
                         CAT,
                         imp = self,
@@ -624,7 +719,7 @@ impl BaseSinkImpl for KvsSink {
 }
 
 impl KvsSink {
-    async fn render_async(
+    fn render_buffer(
         &self,
         buffer: &gstreamer::Buffer,
     ) -> Result<gstreamer::FlowSuccess, gstreamer::FlowError> {
@@ -655,12 +750,20 @@ impl KvsSink {
             let sess_expired = self.is_kvs_session_expired();
             let pending_reset = state.pending_session_reset;
             let pending_mode = state.pending_mode_switch;
-            (should_frag, pending_mode, sess_expired || pending_reset)
+            // Suppress while a reset is already queued: the uploader reports the session
+            // as expired until the worker reconnects, which would otherwise re-trigger
+            // a reset at every boundary in that window.
+            let reset_in_flight = state.session_reset_in_flight.load(Ordering::Acquire);
+            (
+                should_frag,
+                pending_mode,
+                (sess_expired || pending_reset) && !reset_in_flight,
+            )
         };
 
         if should_fragment {
-            // Finalize and send current fragment FIRST (using current mode, before switching)
-            self.finalize_and_send_current_fragment().await?;
+            // Finalize and queue current fragment FIRST (using current mode, before switching)
+            self.finalize_and_enqueue_current_fragment()?;
 
             // Handle pending mode switch at this keyframe boundary (no frame loss!)
             if let Some(new_mode) = pending_new_mode {
@@ -695,10 +798,7 @@ impl KvsSink {
                         imp = self,
                         "Resetting session for Immediate mode transition"
                     );
-                    self.reset_session_at_keyframe(
-                        buffer.pts().unwrap_or(gstreamer::ClockTime::ZERO),
-                    )
-                    .await?;
+                    self.begin_session_reset(buffer.pts().unwrap_or(gstreamer::ClockTime::ZERO));
                 }
             } else if needs_reset {
                 // Session expired or reset pending (not from mode switch)
@@ -707,14 +807,7 @@ impl KvsSink {
                     imp = self,
                     "Resetting session at keyframe boundary (proactive - no frame loss)"
                 );
-                self.reset_session_at_keyframe(buffer.pts().unwrap_or(gstreamer::ClockTime::ZERO))
-                    .await?;
-
-                // Clear the pending reset flag
-                {
-                    let mut state = self.state.lock().unwrap();
-                    state.pending_session_reset = false;
-                }
+                self.begin_session_reset(buffer.pts().unwrap_or(gstreamer::ClockTime::ZERO));
             }
 
             // Start new fragment with this keyframe
@@ -770,39 +863,31 @@ impl KvsSink {
             .unwrap_or(false)
     }
 
-    /// Reset KVS session at keyframe boundary (proactive approach - no frame loss)
-    async fn reset_session_at_keyframe(
-        &self,
-        current_pts: gstreamer::ClockTime,
-    ) -> Result<(), gstreamer::FlowError> {
+    /// Begin a KVS session reset at a keyframe boundary (proactive - no frame loss)
+    ///
+    /// Only the MKV writer reset happens here: it is local, cheap, and must stay on
+    /// the streaming thread because it rebases the PTS offset for subsequent frames.
+    /// The KVS reconnect itself is deferred to the upload worker via
+    /// `pending_new_session`, which tags the next finalized fragment. That keeps the
+    /// MKV session boundary and the KVS session boundary on the same keyframe while
+    /// keeping multi-second network work off this thread.
+    fn begin_session_reset(&self, current_pts: gstreamer::ClockTime) {
+        let mut state = self.state.lock().unwrap();
+
+        if let Some(writer) = state.mkv_writer.as_mut() {
+            writer.reset_for_new_session(current_pts);
+        }
+
+        // Next finalized fragment carries the reset and the fresh MKV headers.
+        state.pending_new_session = true;
+        state.pending_session_reset = false;
+        state.session_reset_in_flight.store(true, Ordering::Release);
+
         gstreamer::info!(
             CAT,
             imp = self,
-            "Resetting KVS session at keyframe boundary (proactive - no frame loss)"
+            "MKV writer reset; KVS session reset deferred to upload worker"
         );
-
-        // Reset MKV writer first (updates session_start_wall_time)
-        {
-            let mut state = self.state.lock().unwrap();
-            if let Some(writer) = state.mkv_writer.as_mut() {
-                writer.reset_for_new_session(current_pts);
-            }
-        }
-
-        // Reset KVS session (new producer timestamp, reconnect)
-        let uploader_arc = self.media_uploader.read().unwrap().clone();
-        uploader_arc
-            .lock()
-            .await
-            .reset_session()
-            .await
-            .map_err(|e| {
-                gstreamer::error!(CAT, imp = self, "Failed to reset KVS session: {}", e);
-                gstreamer::FlowError::Error
-            })?;
-
-        gstreamer::info!(CAT, imp = self, "KVS session reset complete");
-        Ok(())
     }
 
     /// Check if we should fragment based on duration
@@ -820,8 +905,10 @@ impl KvsSink {
         }
     }
 
-    /// Finalize current fragment and send it (upload or buffer based on current mode)
-    async fn finalize_and_send_current_fragment(&self) -> Result<(), gstreamer::FlowError> {
+    /// Finalize the current fragment and hand it to the upload worker.
+    ///
+    /// Synchronous and non-blocking by construction - see `render()`.
+    fn finalize_and_enqueue_current_fragment(&self) -> Result<(), gstreamer::FlowError> {
         let (frames, current_mode) = {
             let state = self.state.lock().unwrap();
             if state.current_fragment_frames.is_empty() {
@@ -831,7 +918,7 @@ impl KvsSink {
         };
 
         // Generate fragment using per-fragment approach
-        let fragment = {
+        let (fragment, starts_new_session, sender) = {
             let mut state = self.state.lock().unwrap();
             let writer = state.mkv_writer.as_mut().ok_or_else(|| {
                 gstreamer::error!(CAT, imp = self, "MKV writer not initialized");
@@ -844,93 +931,176 @@ impl KvsSink {
                 frame_refs.len(),
                 current_mode
             );
-            writer.finalize_fragment(&frame_refs).map_err(|e| {
+            let fragment = writer.finalize_fragment(&frame_refs).map_err(|e| {
                 gstreamer::error!(CAT, imp = self, "Failed to finalize fragment: {}", e);
                 gstreamer::FlowError::Error
-            })?
+            })?;
+
+            let starts_new_session = std::mem::take(&mut state.pending_new_session);
+            (fragment, starts_new_session, state.fragment_tx.clone())
         };
 
         let fragment_size = fragment.total_size();
 
-        // Get buffer manager reference
-        let buffer_mgr = self.get_buffer_manager().ok_or_else(|| {
-            gstreamer::error!(CAT, imp = self, "Buffer manager not initialized");
+        let sender = sender.ok_or_else(|| {
+            gstreamer::error!(CAT, imp = self, "Upload worker not running");
             gstreamer::FlowError::Error
         })?;
 
-        // Handle fragment based on current mode
-        match current_mode {
-            UploadMode::Immediate => {
-                // Try direct upload
-                let uploader_arc = self.media_uploader.read().unwrap().clone();
-                let uploader = uploader_arc.lock().await;
-                match uploader.put_fragment(&fragment).await {
-                    Ok(()) => {
-                        debug!("Fragment uploaded directly ({} bytes)", fragment_size);
-                        Ok(())
-                    }
-                    Err(e) if Self::is_network_error_str(&e.to_string()) => {
-                        // Network failure - switch to BufferOnly mode
-                        gstreamer::warning!(
-                            CAT,
-                            imp = self,
-                            "Network failure detected: {} - switching to BufferOnly mode",
-                            e
-                        );
-
-                        self.handle_network_failure().await?;
-
-                        // Buffer this fragment
-                        buffer_mgr
-                            .lock()
-                            .await
-                            .push_fragment(fragment)
-                            .await
-                            .map_err(|e| {
-                                gstreamer::error!(
-                                    CAT,
-                                    imp = self,
-                                    "Failed to push fragment to buffer: {}",
-                                    e
-                                );
-                                gstreamer::FlowError::Error
-                            })?;
-
-                        info!(
-                            "Buffered fragment ({} bytes) due to network failure",
-                            fragment_size
-                        );
-                        Ok(())
-                    }
-                    Err(e) => {
-                        gstreamer::error!(CAT, imp = self, "Failed to upload fragment: {}", e);
-                        Err(gstreamer::FlowError::Error)
-                    }
-                }
-            }
-            UploadMode::BufferOnly => {
-                // Always buffer
-                buffer_mgr
-                    .lock()
-                    .await
-                    .push_fragment(fragment)
-                    .await
-                    .map_err(|e| {
-                        gstreamer::error!(
-                            CAT,
-                            imp = self,
-                            "Failed to push fragment to buffer: {}",
-                            e
-                        );
-                        gstreamer::FlowError::Error
-                    })?;
-
+        match sender.try_send(UploadItem {
+            fragment,
+            mode: current_mode,
+            starts_new_session,
+        }) {
+            Ok(()) => {
                 debug!(
-                    "Buffered fragment ({} bytes) in BufferOnly mode",
-                    fragment_size
+                    "Queued fragment ({} bytes, mode: {:?}, new session: {})",
+                    fragment_size, current_mode, starts_new_session
                 );
                 Ok(())
             }
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                // The uploader is stalled and its disk-buffer fallback has not kept
+                // up either. Dropping is the only non-blocking option left, so make
+                // it loud rather than silent.
+                // No session reset here: fragment timecodes are ABSOLUTE, so KVS
+                // tolerates the gap, and forcing a reconnect while the uploader is
+                // already stalled would only deepen the stall.
+                let dropped = {
+                    let mut state = self.state.lock().unwrap();
+                    state.dropped_fragments += 1;
+                    state.dropped_fragments
+                };
+
+                gstreamer::warning!(
+                    CAT,
+                    imp = self,
+                    "Upload queue full ({} fragments) - dropped fragment ({} bytes); {} dropped in total",
+                    FRAGMENT_QUEUE_CAPACITY,
+                    item.fragment.total_size(),
+                    dropped
+                );
+
+                // Surface on the bus at the start of an episode, then periodically,
+                // so a sustained stall is visible without flooding.
+                if dropped == 1 || dropped.is_multiple_of(50) {
+                    gstreamer::element_imp_warning!(
+                        self,
+                        gstreamer::ResourceError::Write,
+                        [
+                            "KVS upload queue full - dropped {} fragment(s); uploader and disk buffer are not keeping up",
+                            dropped
+                        ]
+                    );
+                }
+
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                gstreamer::error!(
+                    CAT,
+                    imp = self,
+                    "Upload worker stopped - cannot queue fragment"
+                );
+                Err(gstreamer::FlowError::Error)
+            }
+        }
+    }
+
+    /// Upload worker - owns every network and disk operation for finalized fragments.
+    ///
+    /// Runs on the Tokio runtime, never on a GStreamer streaming thread, so it is
+    /// free to spend minutes in `reset_session`/`reconnect_with_backoff` without
+    /// affecting capture.
+    async fn upload_worker(
+        element_weak: glib::WeakRef<super::KvsSink>,
+        mut rx: mpsc::Receiver<UploadItem>,
+        uploader: Arc<AsyncMutex<Box<dyn MediaUploader>>>,
+        buffer_mgr: Arc<AsyncMutex<BufferedUploadManager>>,
+        session_reset_in_flight: Arc<AtomicBool>,
+    ) {
+        gstreamer::info!(CAT, "Upload worker started");
+
+        while let Some(item) = rx.recv().await {
+            let UploadItem {
+                fragment,
+                mode,
+                starts_new_session,
+            } = item;
+
+            if starts_new_session {
+                gstreamer::info!(CAT, "Resetting KVS session before next fragment");
+                let guard = uploader.lock().await;
+                let result = guard.reset_session().await;
+                drop(guard);
+
+                // Clear unconditionally: on failure the uploader still reports the
+                // session as expired, so the next keyframe boundary retries the reset.
+                session_reset_in_flight.store(false, Ordering::Release);
+
+                if let Err(e) = result {
+                    gstreamer::error!(CAT, "Failed to reset KVS session: {}", e);
+                }
+            }
+
+            match mode {
+                UploadMode::Immediate => {
+                    let guard = uploader.lock().await;
+                    let result = guard.put_fragment(&fragment).await;
+                    // Release before taking the buffer manager: `trigger_upload_all`
+                    // holds the buffer manager while locking the uploader, so holding
+                    // both in the opposite order here would deadlock.
+                    drop(guard);
+
+                    match result {
+                        Ok(()) => {
+                            debug!(
+                                "Fragment uploaded directly ({} bytes)",
+                                fragment.total_size()
+                            )
+                        }
+                        Err(e) => {
+                            if Self::is_network_error_str(&e.to_string()) {
+                                gstreamer::warning!(
+                                    CAT,
+                                    "Network failure detected: {} - switching to BufferOnly mode",
+                                    e
+                                );
+                                if let Some(element) = element_weak.upgrade() {
+                                    let _ = element.imp().handle_network_failure().await;
+                                }
+                            } else {
+                                gstreamer::error!(
+                                    CAT,
+                                    "Failed to upload fragment: {} - buffering to disk",
+                                    e
+                                );
+                            }
+                            Self::buffer_fragment(&buffer_mgr, fragment).await;
+                        }
+                    }
+                }
+                UploadMode::BufferOnly => Self::buffer_fragment(&buffer_mgr, fragment).await,
+            }
+        }
+
+        gstreamer::info!(CAT, "Upload worker stopped");
+    }
+
+    /// Persist a fragment to the on-disk buffer, logging failure.
+    async fn buffer_fragment(
+        buffer_mgr: &Arc<AsyncMutex<BufferedUploadManager>>,
+        fragment: Fragment,
+    ) {
+        let size = fragment.total_size();
+        match buffer_mgr.lock().await.push_fragment(fragment).await {
+            Ok(()) => debug!("Buffered fragment ({} bytes)", size),
+            Err(e) => gstreamer::error!(
+                CAT,
+                "Failed to push fragment ({} bytes) to buffer: {}",
+                size,
+                e
+            ),
         }
     }
 

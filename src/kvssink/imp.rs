@@ -30,7 +30,9 @@ const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
 /// so any stall here starves the hardware encoder's surface pool and kills the
 /// pipeline. Fragments are handed to a worker task instead, and this bound is
 /// what keeps a stalled uploader from growing memory without limit. At 2s
-/// Immediate-mode fragments this is ~2 minutes of video.
+/// Immediate-mode fragments this is ~2 minutes of video; at 15s BufferOnly
+/// fragments it is ~16 minutes, so the binding constraint is memory - worst
+/// case is 64 fragments held in RAM at the stream bitrate.
 const FRAGMENT_QUEUE_CAPACITY: usize = 64;
 
 /// Time allowed for the upload worker to drain in-flight fragments on shutdown.
@@ -84,8 +86,6 @@ struct State {
     consecutive_failures: u32,
     /// Timestamp of last recovery attempt (to prevent duplicate tasks)
     last_recovery_attempt: Option<Instant>,
-    /// Flag to trigger session reset at next keyframe (set by mode switch)
-    pending_session_reset: bool,
     /// Pending mode switch to execute at next keyframe boundary (prevents frame loss)
     pending_mode_switch: Option<UploadMode>,
     /// Handoff to the upload worker. `None` before start()/after stop().
@@ -119,7 +119,6 @@ impl Default for State {
             recovery_task: None,
             consecutive_failures: 0,
             last_recovery_attempt: None,
-            pending_session_reset: false,
             pending_mode_switch: None,
             fragment_tx: None,
             upload_task: None,
@@ -609,18 +608,22 @@ impl BaseSinkImpl for KvsSink {
         };
         drop(sender);
 
-        if let Some(task) = upload_task {
+        if let Some(mut task) = upload_task {
             let drained = tokio::task::block_in_place(|| {
                 self.ensure_runtime()
-                    .block_on(async { tokio::time::timeout(WORKER_DRAIN_TIMEOUT, task).await })
+                    .block_on(async { tokio::time::timeout(WORKER_DRAIN_TIMEOUT, &mut task).await })
                     .is_ok()
             });
 
             if !drained {
+                // Abort rather than detach: a stuck worker would otherwise hold the
+                // uploader mutex into the next start() and could still mutate the new
+                // session's state via handle_network_failure().
+                task.abort();
                 gstreamer::warning!(
                     CAT,
                     imp = self,
-                    "Upload worker did not drain within {:?} - abandoning in-flight fragments",
+                    "Upload worker did not drain within {:?} - aborting it and abandoning in-flight fragments",
                     WORKER_DRAIN_TIMEOUT
                 );
             }
@@ -748,17 +751,12 @@ impl KvsSink {
             let should_frag =
                 is_keyframe && self.should_fragment_on_duration(&state, buffer, &settings);
             let sess_expired = self.is_kvs_session_expired();
-            let pending_reset = state.pending_session_reset;
             let pending_mode = state.pending_mode_switch;
             // Suppress while a reset is already queued: the uploader reports the session
             // as expired until the worker reconnects, which would otherwise re-trigger
             // a reset at every boundary in that window.
             let reset_in_flight = state.session_reset_in_flight.load(Ordering::Acquire);
-            (
-                should_frag,
-                pending_mode,
-                (sess_expired || pending_reset) && !reset_in_flight,
-            )
+            (should_frag, pending_mode, sess_expired && !reset_in_flight)
         };
 
         if should_fragment {
@@ -801,7 +799,7 @@ impl KvsSink {
                     self.begin_session_reset(buffer.pts().unwrap_or(gstreamer::ClockTime::ZERO));
                 }
             } else if needs_reset {
-                // Session expired or reset pending (not from mode switch)
+                // Session expired (not from mode switch)
                 gstreamer::info!(
                     CAT,
                     imp = self,
@@ -880,7 +878,6 @@ impl KvsSink {
 
         // Next finalized fragment carries the reset and the fresh MKV headers.
         state.pending_new_session = true;
-        state.pending_session_reset = false;
         state.session_reset_in_flight.store(true, Ordering::Release);
 
         gstreamer::info!(
@@ -969,6 +966,13 @@ impl KvsSink {
                 let dropped = {
                     let mut state = self.state.lock().unwrap();
                     state.dropped_fragments += 1;
+                    // The reset tag must survive the drop: the worker only clears
+                    // session_reset_in_flight when it sees a tagged fragment, so
+                    // losing the tag would suppress every future proactive reset.
+                    // The MKV writer is already reset, so only the tag is re-armed.
+                    if item.starts_new_session {
+                        state.pending_new_session = true;
+                    }
                     state.dropped_fragments
                 };
 
@@ -1392,3 +1396,110 @@ static CAT: Lazy<gstreamer::DebugCategory> = Lazy::new(|| {
         Some("KVS Sink"),
     )
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kvs_client::KvsError;
+    use crate::media_uploader::MediaUploader;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct NoopUploader;
+
+    impl MediaUploader for NoopUploader {
+        fn initialize(
+            &self,
+            _stream_name: &str,
+            _region: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), KvsError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn put_fragment<'a>(
+            &'a self,
+            _fragment: &'a Fragment,
+        ) -> Pin<Box<dyn Future<Output = Result<(), KvsError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn is_session_expired(&self) -> bool {
+            false
+        }
+
+        fn reset_session(&self) -> Pin<Box<dyn Future<Output = Result<(), KvsError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn make_frame(pts_ms: u64) -> gstreamer::Buffer {
+        let mut buffer = gstreamer::Buffer::with_size(64).unwrap();
+        buffer
+            .get_mut()
+            .unwrap()
+            .set_pts(gstreamer::ClockTime::from_mseconds(pts_ms));
+        buffer
+    }
+
+    /// A fragment tagged `starts_new_session` that is dropped on a full queue must
+    /// re-arm `pending_new_session`: the worker only clears `session_reset_in_flight`
+    /// when it sees a tagged fragment, so losing the tag would suppress every future
+    /// proactive session reset for the lifetime of the pipeline.
+    #[test]
+    fn dropped_tagged_fragment_rearms_session_reset() {
+        gstreamer::init().unwrap();
+
+        let element = crate::kvssink::KvsSink::with_uploader(NoopUploader);
+        let imp = element.imp();
+
+        // Single-slot queue with no worker draining it, so the second enqueue
+        // deterministically hits TrySendError::Full. `_rx` must stay alive or
+        // try_send would report Closed instead.
+        let (tx, _rx) = mpsc::channel(1);
+        {
+            let mut state = imp.state.lock().unwrap();
+            state.mkv_writer = Some(MkvWriter::new());
+            state.fragment_tx = Some(tx);
+            state.current_fragment_frames = vec![make_frame(0)];
+            state.pending_new_session = true;
+            state.session_reset_in_flight.store(true, Ordering::Release);
+        }
+
+        // Fits in the queue: the tag travels with the fragment.
+        imp.finalize_and_enqueue_current_fragment().unwrap();
+        {
+            let mut state = imp.state.lock().unwrap();
+            assert!(
+                !state.pending_new_session,
+                "tag should be consumed by the enqueued fragment"
+            );
+            assert_eq!(state.dropped_fragments, 0);
+
+            state.pending_new_session = true;
+            state.current_fragment_frames = vec![make_frame(100)];
+        }
+
+        // Queue full: fragment is dropped, but the tag must be re-armed.
+        imp.finalize_and_enqueue_current_fragment().unwrap();
+        {
+            let state = imp.state.lock().unwrap();
+            assert_eq!(state.dropped_fragments, 1);
+            assert!(
+                state.pending_new_session,
+                "reset tag must be re-armed when its fragment is dropped"
+            );
+            assert!(state.session_reset_in_flight.load(Ordering::Acquire));
+        }
+
+        // An untagged drop must not arm a reset.
+        {
+            let mut state = imp.state.lock().unwrap();
+            state.pending_new_session = false;
+            state.current_fragment_frames = vec![make_frame(200)];
+        }
+        imp.finalize_and_enqueue_current_fragment().unwrap();
+        let state = imp.state.lock().unwrap();
+        assert_eq!(state.dropped_fragments, 2);
+        assert!(!state.pending_new_session);
+    }
+}

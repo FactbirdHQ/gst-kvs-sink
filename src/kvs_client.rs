@@ -362,7 +362,6 @@ impl KvsConnection {
             .to_string();
 
         // Reset session tracking
-        self.session_start = Instant::now();
         self.next_fragment_num = 1;
         self.first_fragment_of_connection = true;
         self.fragment_status.clear();
@@ -374,6 +373,11 @@ impl KvsConnection {
 
         // Reconnect with new session
         self.reconnect_with_backoff().await?;
+
+        // Rebase the expiry clock only once the new session is live:
+        // is_session_expired() must keep returning true after a failed reset so
+        // the sink retries the reset at the next keyframe boundary.
+        self.session_start = Instant::now();
 
         Ok(())
     }

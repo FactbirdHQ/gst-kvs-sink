@@ -1,6 +1,7 @@
 //! Common test utilities for stream-manager tests
 
 pub mod failable_uploader;
+pub mod gated_uploader;
 pub mod test_media_uploader;
 
 use anyhow::Result;

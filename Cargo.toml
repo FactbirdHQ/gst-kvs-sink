@@ -2,6 +2,7 @@
 name = "gst-kvs-sink"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87" # u64::is_multiple_of
 license = "MIT"
 repository = "https://github.com/FactbirdHQ/gst-kvs-sink"
 description = "GStreamer sink that publishes media fragments to AWS Kinesis Video Streams"

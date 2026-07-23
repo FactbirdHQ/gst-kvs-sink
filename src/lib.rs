@@ -10,7 +10,7 @@
 //! gstreamer::init()?;
 //! gstrskvssink::register(None)?;
 //!
-//! let pipeline = gstreamer::parse_launch(
+//! let pipeline = gstreamer::parse::launch(
 //!     "videotestsrc ! x264enc ! video/x-h264,stream-format=avc,alignment=au ! \
 //!      rskvssink stream-name=demo buffer-directory=/tmp/kvs-buf",
 //! )?;

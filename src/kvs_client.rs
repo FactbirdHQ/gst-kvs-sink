@@ -13,7 +13,6 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_stream::StreamExt;
@@ -87,7 +86,9 @@ struct FragmentAckStatus {
 
 /// Public KVS client for uploading video fragments
 pub struct KvsClient {
-    inner: Arc<Mutex<Option<KvsConnection>>>,
+    // Not Arc: KvsClient is never cloned - it is boxed once into the sink's
+    // shared Arc<AsyncMutex<Box<dyn MediaUploader>>>, which owns the sharing.
+    inner: Mutex<Option<KvsConnection>>,
 }
 
 /// Internal KVS connection state for persistent streaming
@@ -167,7 +168,7 @@ impl KvsClient {
     /// Create an uninitialized KVS client
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(None)),
+            inner: Mutex::new(None),
         }
     }
 }
@@ -362,7 +363,6 @@ impl KvsConnection {
             .to_string();
 
         // Reset session tracking
-        self.session_start = Instant::now();
         self.next_fragment_num = 1;
         self.first_fragment_of_connection = true;
         self.fragment_status.clear();
@@ -374,6 +374,11 @@ impl KvsConnection {
 
         // Reconnect with new session
         self.reconnect_with_backoff().await?;
+
+        // Rebase the expiry clock only once the new session is live:
+        // is_session_expired() must keep returning true after a failed reset so
+        // the sink retries the reset at the next keyframe boundary.
+        self.session_start = Instant::now();
 
         Ok(())
     }

@@ -37,6 +37,8 @@ jobs:
         run: cargo build --release
       - name: cargo test
         run: cargo test --lib --tests -- --skip kvs_integration
+      - name: cargo test --doc
+        run: cargo test --doc
       - name: gst-inspect the built plugin
         run: |
           GST_PLUGIN_PATH=$PWD/target/release gst-inspect-1.0 rskvssink

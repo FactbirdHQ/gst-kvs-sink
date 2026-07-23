@@ -4,7 +4,7 @@ use anyhow::Result;
 use gstrskvssink::advanced::{Fragment, KvsError, MediaUploader};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::debug;
@@ -53,13 +53,21 @@ impl ErrorType {
 }
 
 /// Mock uploader that can simulate various failure scenarios
+///
+/// Cloning shares all state: the sink consumes one clone by value while the
+/// test keeps another to observe counters and captured fragments.
+#[derive(Clone)]
 pub struct FailableMediaUploader {
     failure_config: FailureConfig,
     error_type: ErrorType,
-    upload_count: Arc<AtomicUsize>,
-    upload_times: Arc<Mutex<Vec<Instant>>>,
-    fragments: Arc<Mutex<Vec<Fragment>>>,
-    initialized: Arc<Mutex<bool>>,
+    inner: Arc<FailableInner>,
+}
+
+struct FailableInner {
+    upload_count: AtomicUsize,
+    upload_times: Mutex<Vec<Instant>>,
+    fragments: Mutex<Vec<Fragment>>,
+    initialized: AtomicBool,
 }
 
 impl FailableMediaUploader {
@@ -67,10 +75,12 @@ impl FailableMediaUploader {
         Self {
             failure_config: FailureConfig::AlwaysSucceed,
             error_type: ErrorType::NetworkError,
-            upload_count: Arc::new(AtomicUsize::new(0)),
-            upload_times: Arc::new(Mutex::new(Vec::new())),
-            fragments: Arc::new(Mutex::new(Vec::new())),
-            initialized: Arc::new(Mutex::new(false)),
+            inner: Arc::new(FailableInner {
+                upload_count: AtomicUsize::new(0),
+                upload_times: Mutex::new(Vec::new()),
+                fragments: Mutex::new(Vec::new()),
+                initialized: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -98,19 +108,19 @@ impl FailableMediaUploader {
     /// Get the number of upload attempts made
     #[allow(dead_code)]
     pub fn upload_count(&self) -> usize {
-        self.upload_count.load(Ordering::SeqCst)
+        self.inner.upload_count.load(Ordering::SeqCst)
     }
 
     /// Get the timestamps of all upload attempts
     #[allow(dead_code)]
     pub fn upload_times(&self) -> Vec<Instant> {
-        self.upload_times.lock().unwrap().clone()
+        self.inner.upload_times.lock().unwrap().clone()
     }
 
     /// Get all successfully uploaded fragments
     #[allow(dead_code)]
     pub fn captured_fragments(&self) -> Vec<Fragment> {
-        self.fragments.lock().unwrap().clone()
+        self.inner.fragments.lock().unwrap().clone()
     }
 
     /// Check if the uploader should fail for this attempt
@@ -135,19 +145,6 @@ impl Default for FailableMediaUploader {
     }
 }
 
-impl Clone for FailableMediaUploader {
-    fn clone(&self) -> Self {
-        Self {
-            failure_config: self.failure_config.clone(),
-            error_type: self.error_type.clone(),
-            upload_count: Arc::clone(&self.upload_count),
-            upload_times: Arc::clone(&self.upload_times),
-            fragments: Arc::clone(&self.fragments),
-            initialized: Arc::clone(&self.initialized),
-        }
-    }
-}
-
 impl MediaUploader for FailableMediaUploader {
     fn initialize(
         &self,
@@ -156,7 +153,7 @@ impl MediaUploader for FailableMediaUploader {
     ) -> Pin<Box<dyn Future<Output = Result<(), KvsError>> + Send + '_>> {
         Box::pin(async move {
             debug!("FailableMediaUploader initialized");
-            *self.initialized.lock().unwrap() = true;
+            self.inner.initialized.store(true, Ordering::SeqCst);
             Ok(())
         })
     }
@@ -166,8 +163,8 @@ impl MediaUploader for FailableMediaUploader {
         fragment: &'a Fragment,
     ) -> Pin<Box<dyn Future<Output = Result<(), KvsError>> + Send + 'a>> {
         Box::pin(async move {
-            let attempt = self.upload_count.fetch_add(1, Ordering::SeqCst);
-            self.upload_times.lock().unwrap().push(Instant::now());
+            let attempt = self.inner.upload_count.fetch_add(1, Ordering::SeqCst);
+            self.inner.upload_times.lock().unwrap().push(Instant::now());
 
             debug!(
                 "FailableMediaUploader: Upload attempt {} for fragment {:?}",
@@ -188,7 +185,7 @@ impl MediaUploader for FailableMediaUploader {
                 "FailableMediaUploader: Successfully uploaded fragment {:?} (attempt {})",
                 fragment.fragment_number, attempt
             );
-            self.fragments.lock().unwrap().push(fragment.clone());
+            self.inner.fragments.lock().unwrap().push(fragment.clone());
             Ok(())
         })
     }

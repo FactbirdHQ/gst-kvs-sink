@@ -13,7 +13,6 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_stream::StreamExt;
@@ -87,7 +86,9 @@ struct FragmentAckStatus {
 
 /// Public KVS client for uploading video fragments
 pub struct KvsClient {
-    inner: Arc<Mutex<Option<KvsConnection>>>,
+    // Not Arc: KvsClient is never cloned - it is boxed once into the sink's
+    // shared Arc<AsyncMutex<Box<dyn MediaUploader>>>, which owns the sharing.
+    inner: Mutex<Option<KvsConnection>>,
 }
 
 /// Internal KVS connection state for persistent streaming
@@ -167,7 +168,7 @@ impl KvsClient {
     /// Create an uninitialized KVS client
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(None)),
+            inner: Mutex::new(None),
         }
     }
 }

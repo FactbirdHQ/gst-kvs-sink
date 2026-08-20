@@ -24,7 +24,12 @@ once_cell = "1.19"
 
 # AWS
 aws-config = "1.8"
-aws-sdk-kinesisvideo = "1.99"
+# default-features = false drops the `rustls` feature, which pulls the legacy
+# hyper 0.14 / h2 0.3 stack (unfixable RUSTSEC-2026-0258) via aws-smithy-runtime/tls-rustls
+aws-sdk-kinesisvideo = { version = "1.99", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-types = "1.3"
 aws-sigv4 = "1.4"
 aws-smithy-runtime-api = "1.11"
